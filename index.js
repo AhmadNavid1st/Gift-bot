@@ -8,6 +8,8 @@
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const { once } = require('events');
 
 // ┌───────────────────────────────────────────────────────────────────────────────────────┐
 // │ 1️⃣ READ BOT TOKEN                                                                      │
@@ -44,6 +46,25 @@ process.on('unhandledRejection', (reason, promise) => {
 process.on('uncaughtException', (err) => {
   console.error('⚠️ [Uncaught Exception]:', err);
 });
+
+// Graceful shutdown
+function setupGracefulShutdown(bot) {
+  const shutdown = async (signal) => {
+    try {
+      console.log(`\n🛑 Received ${signal}. Stopping bot polling...`);
+      await bot.stopPolling();
+      console.log('✅ Bot polling stopped. Exiting.');
+      process.exit(0);
+    } catch (e) {
+      console.warn('⚠️ Error during shutdown:', e);
+      process.exit(1);
+    }
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+}
+
+setupGracefulShutdown(bot);
 
 // ┌───────────────────────────────────────────────────────────────────────────────────────┐
 // │ 4️⃣ REPLY KEYBOARD CONFIGURATION                                                         │
@@ -83,9 +104,97 @@ bot.onText(/\/start/, (msg) => {
 });
 
 // ┌───────────────────────────────────────────────────────────────────────────────────────┐
+// │ Utility helpers                                                                       │
+// └───────────────────────────────────────────────────────────────────────────────────────┘
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function sendMessageWithRetry(bot, chatId, text, options = {}, attempt = 0) {
+  try {
+    return await bot.sendMessage(chatId, text, options);
+  } catch (err) {
+    const retryAfter = err?.response?.body?.parameters?.retry_after;
+    const statusCode = err?.response?.statusCode ?? err?.code;
+    if (attempt < 5 && (retryAfter || statusCode === 429)) {
+      const waitMs = (retryAfter ? (retryAfter * 1000) : (500 * Math.pow(2, attempt)));
+      console.warn(`⏳ Rate limited (attempt ${attempt + 1}). Waiting ${waitMs}ms before retrying...`);
+      await delay(waitMs);
+      return sendMessageWithRetry(bot, chatId, text, options, attempt + 1);
+    }
+    throw err;
+  }
+}
+
+async function sendDocumentWithRetry(bot, chatId, documentStream, options = {}, fileOptions = {}, attempt = 0) {
+  try {
+    return await bot.sendDocument(chatId, documentStream, options, fileOptions);
+  } catch (err) {
+    const retryAfter = err?.response?.body?.parameters?.retry_after;
+    const statusCode = err?.response?.statusCode ?? err?.code;
+    if (attempt < 5 && (retryAfter || statusCode === 429)) {
+      const waitMs = (retryAfter ? (retryAfter * 1000) : (500 * Math.pow(2, attempt)));
+      console.warn(`⏳ Rate limited (doc, attempt ${attempt + 1}). Waiting ${waitMs}ms before retrying...`);
+      await delay(waitMs);
+      return sendDocumentWithRetry(bot, chatId, documentStream, options, fileOptions, attempt + 1);
+    }
+    throw err;
+  }
+}
+
+async function sendLinksInChunksSequentially(bot, chatId, prefix, startIndex, totalCount, chunkSize, delayMs) {
+  const endIndex = startIndex + totalCount - 1;
+  for (let chunkStartNum = startIndex; chunkStartNum <= endIndex; chunkStartNum += chunkSize) {
+    const chunkEndNum = Math.min(chunkStartNum + chunkSize - 1, endIndex);
+
+    const lines = [
+      `<pre>╔═══════════════════════════════╗`,
+      `║   📦 Links ${chunkStartNum} – ${chunkEndNum}   ║`,
+      `╚═══════════════════════════════╝</pre>`
+    ];
+
+    for (let num = chunkStartNum; num <= chunkEndNum; num++) {
+      const link = `${prefix}${num}`;
+      lines.push(`🔗 <a href="${link}">${link}</a>`);
+    }
+
+    const chunkMsg = lines.join('\n') + '\n';
+
+    await sendMessageWithRetry(bot, chatId, chunkMsg, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true
+    });
+
+    await delay(delayMs);
+  }
+}
+
+async function writeLinksToTempFile(prefix, startIndex, totalCount) {
+  const tempFilePath = path.join(
+    os.tmpdir(),
+    `gift-links-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`
+  );
+
+  const writeStream = fs.createWriteStream(tempFilePath, { encoding: 'utf8' });
+  const endIndex = startIndex + totalCount - 1;
+
+  for (let num = startIndex; num <= endIndex; num++) {
+    const link = `${prefix}${num}\n`;
+    if (!writeStream.write(link)) {
+      await once(writeStream, 'drain');
+    }
+  }
+
+  await new Promise((resolve, reject) => {
+    writeStream.end(() => resolve());
+    writeStream.on('error', reject);
+  });
+
+  return tempFilePath;
+}
+
+// ┌───────────────────────────────────────────────────────────────────────────────────────┐
 // │ 6️⃣ HANDLE MESSAGES                                                                     │
 // └───────────────────────────────────────────────────────────────────────────────────────┘
-bot.on('message', (msg) => {
+bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text ? msg.text.trim() : '';
 
@@ -98,9 +207,9 @@ bot.on('message', (msg) => {
     // ──────────────────────────────────────────────────────────────────────────────────────
     if (text === '🎁 Gift Links 🎁') {
       const promptMsg =
-        `<pre>╔═══════════════════════════════╗
-║      🎁 Gift Link Section      ║
-╚═══════════════════════════════╝</pre>\n` +
+        `<pre>╔═══════════════════════════════╗\n` +
+        `║      🎁 Gift Link Section      ║\n` +
+        `╚═══════════════════════════════╝</pre>\n` +
         `🔹 Send me a link in this format:\n` +
         `<code>http://t.me/nft/ToyBear-1 1000000</code>\n\n` +
         `• The part before “-1” is the <b>base URL</b>.\n` +
@@ -114,7 +223,7 @@ bot.on('message', (msg) => {
         `http://t.me/nft/ToyBear-1000000\n\n` +
         `⚙️ Please send it when you’re ready!`;
       
-      bot.sendMessage(chatId, promptMsg, { parse_mode: 'HTML' })
+      await sendMessageWithRetry(bot, chatId, promptMsg, { parse_mode: 'HTML' })
         .then(() => console.log(`✅ Prompted user ${chatId} for link input`))
         .catch((err) => console.error(`❌ [PromptMsg Error]: ${err.message}`));
       
@@ -135,7 +244,8 @@ bot.on('message', (msg) => {
 
       // Input validation
       if (isNaN(startIndex) || isNaN(totalCount) || startIndex < 0 || totalCount <= 0) {
-        bot.sendMessage(
+        await sendMessageWithRetry(
+          bot,
           chatId,
           `❌ <b>Error:</b> The starting index must be ≥ 0 and the total count must be a positive number.\n\n` +
           `Please try again with a proper format.`,
@@ -147,7 +257,8 @@ bot.on('message', (msg) => {
 
       // Update: Allow up to 1,000,000 links
       if (totalCount > 1000000) {
-        bot.sendMessage(
+        await sendMessageWithRetry(
+          bot,
           chatId,
           `⚠️ <b>Warning:</b> Generating more than 1,000,000 links at once may cause delays or exceed Telegram rate limits.\n` +
           `Please choose a smaller count (≤ 1,000,000) or generate in batches.`,
@@ -164,43 +275,55 @@ bot.on('message', (msg) => {
       console.log(`🛠️ [Link Generation Starting] Chat ${chatId}: start=${startIndex}, count=${totalCount}`);
 
       // Notify user that generation is in progress
-      bot.sendMessage(
+      await sendMessageWithRetry(
+        bot,
         chatId,
-        `<pre>╔═══════════════════════════════╗
-║      ⏳ Generating Links...       ║
-╚═══════════════════════════════╝</pre>`,
+        `<pre>╔═══════════════════════════════╗\n` +
+        `║      ⏳ Generating Links...       ║\n` +
+        `╚═══════════════════════════════╝</pre>`,
         { parse_mode: 'HTML' }
       ).catch((err) => console.error(`❌ [GeneratingMsg Error]: ${err.message}`));
 
       // ──────────────────────────────────────────────────────────────────────────────────────
-      // 6.3 STREAM & SEND IN CHUNKS OF 20 (to avoid large memory footprint)
+      // 6.3 Optimized sending strategy
+      //     - For large volumes, stream to a temporary file and send as a document
+      //     - For smaller volumes, send sequentially in chunks with a small delay
       // ──────────────────────────────────────────────────────────────────────────────────────
-      const chunkSize = 20;
-      const totalChunks = Math.ceil(totalCount / chunkSize);
+      const CHUNK_SIZE = 20;
+      const DELAY_MS = 750; // balance rate limits and speed
+      const FILE_THRESHOLD = 1000; // switch to file for larger runs
 
-      for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
-        // Compute the start and end numbers for this chunk
-        const chunkStartNum = startIndex + chunkIdx * chunkSize;
-        const chunkEndNum = Math.min(chunkStartNum + chunkSize - 1, endIndex);
+      try {
+        if (totalCount >= FILE_THRESHOLD) {
+          const tempFilePath = await writeLinksToTempFile(prefix, startIndex, totalCount);
+          const fileName = `links_${startIndex}-${endIndex}.txt`;
 
-        // Build the chunk message header
-        let chunkMsg =
-          `<pre>╔═══════════════════════════════╗
-║   📦 Links ${chunkStartNum} – ${chunkEndNum}   ║
-╚═══════════════════════════════╝</pre>\n`;
+          await sendDocumentWithRetry(
+            bot,
+            chatId,
+            fs.createReadStream(tempFilePath),
+            { caption: `📄 Generated ${totalCount.toLocaleString()} links.` },
+            { filename: fileName }
+          );
 
-        // Generate and append each link in this chunk
-        for (let num = chunkStartNum; num <= chunkEndNum; num++) {
-          const link = `${prefix}${num}`;
-          chunkMsg += `🔗 <a href="${link}">${link}</a>\n`;
+          fs.unlink(tempFilePath, (err) => {
+            if (err) console.warn(`⚠️ Could not remove temp file: ${tempFilePath}`, err);
+          });
+
+          console.log(`✅ Sent text file (${fileName}) with ${totalCount} links to ${chatId}`);
+        } else {
+          await sendLinksInChunksSequentially(bot, chatId, prefix, startIndex, totalCount, CHUNK_SIZE, DELAY_MS);
+          console.log(`✅ Sent ${totalCount} links to ${chatId} in chunks`);
         }
-
-        // Send this chunk with a staggered delay to respect rate limits
-        setTimeout(() => {
-          bot.sendMessage(chatId, chunkMsg, { parse_mode: 'HTML', disable_web_page_preview: true })
-            .then(() => console.log(`✅ Sent links ${chunkStartNum}–${chunkEndNum} to ${chatId}`))
-            .catch((err) => console.error(`❌ [ChunkMsg Error]: ${err.message}`));
-        }, chunkIdx * 700); // 700ms between each batch
+      } catch (err) {
+        console.error(`❌ [Send Strategy Error]: ${err.message}`);
+        // Fallback: try chunked messages if file sending failed
+        try {
+          await sendMessageWithRetry(bot, chatId, `⚠️ Could not send as a file; falling back to chunked messages…`, { parse_mode: 'HTML' });
+          await sendLinksInChunksSequentially(bot, chatId, prefix, startIndex, totalCount, CHUNK_SIZE, DELAY_MS);
+        } catch (err2) {
+          console.error(`❌ [Fallback Chunk Send Error]: ${err2.message}`);
+        }
       }
 
       return;
@@ -214,13 +337,14 @@ bot.on('message', (msg) => {
       `• Press <b>🎁 Gift Links 🎁</b> to start.\n` +
       `• Or send in the format: <code>http://t.me/nft/ToyBear-1 1000000</code>\n\n` +
       `Let’s give it another try! 😊`;
-    bot.sendMessage(chatId, unknownMsg, { parse_mode: 'HTML' })
+    await sendMessageWithRetry(bot, chatId, unknownMsg, { parse_mode: 'HTML' })
       .then(() => console.log(`⚠️ Sent unknown-format notice to ${chatId}`))
       .catch((err) => console.error(`❌ [UnknownMsg Error]: ${err.message}`));
 
   } catch (err) {
     console.error(`❌ [Message Handler Error]: ${err.message}`);
-    bot.sendMessage(
+    await sendMessageWithRetry(
+      bot,
       chatId,
       `😓 <b>Sorry!</b> Something went wrong on my side. Please try again later.`,
       { parse_mode: 'HTML' }

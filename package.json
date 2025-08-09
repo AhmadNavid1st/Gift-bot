@@ -1,0 +1,16 @@
+{
+  "name": "telegram-gift-link-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot that generates gift links efficiently with chunked sending and streaming to file for large batches.",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.64.0"
+  }
+}

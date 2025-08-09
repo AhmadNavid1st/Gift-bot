@@ -1,0 +1,13 @@
+node_modules/
+.env
+npm-debug.log*
+yarn-error.log*
+.DS_Store
+
+# Telegram token
+/tg.txt
+
+# Temporary files
+*.tmp
+*.log
+*.swp
